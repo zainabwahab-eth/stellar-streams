@@ -23,6 +23,8 @@ import {
   formatTokenAmount,
   parseTokenAmount,
   computeProgressBps,
+  computeClaimable,
+  computeProtocolFee,
   formatBps,
   formatDuration,
 } from '@stellar-starter-kit/utils';
@@ -37,6 +39,7 @@ const CONTRACT_ID = process.env.NEXT_PUBLIC_STREAM_CONTRACT_ID ?? '';
 const DEFAULT_TOKEN =
   process.env.NEXT_PUBLIC_TOKEN_CONTRACT_ID ||
   'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+const EXPERT_URL = process.env.NEXT_PUBLIC_STELLAR_EXPERT_URL ?? 'https://stellar.expert';
 
 const DAY = 86_400;
 
@@ -59,6 +62,7 @@ export default function StreamsDashboard() {
   const [lookupId, setLookupId] = useState('');
   const [stream, setStream] = useState<Stream | null>(null);
   const [claimable, setClaimable] = useState<bigint>(0n);
+  const [feeBps, setFeeBps] = useState<number>(0);
   const [streamToken, setStreamToken] = useState<TokenMetadata | null>(null);
   const [loadingStream, setLoadingStream] = useState(false);
 
@@ -91,7 +95,10 @@ export default function StreamsDashboard() {
       try {
         const found = await client.getStream(id);
         setStream(found);
-        setClaimable(found ? await client.claimable(id).catch(() => 0n) : 0n);
+        const now = Math.floor(Date.now() / 1000);
+        setClaimable(found ? computeClaimable(found, now) : 0n);
+        const config = await client.getConfig().catch(() => null);
+        setFeeBps(config ? config.feeBps : 0);
         // Amounts are in the token's smallest unit; read its decimals to display them.
         setStreamToken(found ? await client.getTokenMetadata(found.token).catch(() => null) : null);
         if (!found) notify('error', `No stream found with id ${id}.`);
@@ -111,7 +118,11 @@ export default function StreamsDashboard() {
       setError(null);
       try {
         const { hash } = await action();
-        notify('success', `${label} submitted successfully. Tx ${formatAddress(hash, 6)}`);
+        const expertLink = `${EXPERT_URL}/tx/${hash}`;
+        notify(
+          'success',
+          `${label} submitted successfully. Tx ${formatAddress(hash, 6)} ${expertLink ? '• <a href="' + expertLink + '" target="_blank" rel="noreferrer">View on explorer</a>' : ''}`,
+        );
         await loadStream(id);
       } catch (err) {
         notify('error', err instanceof Error ? err.message : `${label} failed.`);
@@ -152,7 +163,11 @@ export default function StreamsDashboard() {
         endTime,
         cliffTime,
       });
-      notify('success', `Stream created. Tx ${formatAddress(hash, 6)}`);
+      const expertLink = `${EXPERT_URL}/tx/${hash}`;
+      notify(
+        'success',
+        `Stream created. Tx ${formatAddress(hash, 6)} ${expertLink ? '• <a href="' + expertLink + '" target="_blank" rel="noreferrer">View on explorer</a>' : ''}`,
+      );
       setRecipient('');
     } catch (err) {
       notify('error', err instanceof Error ? err.message : 'Failed to create stream.');
@@ -179,6 +194,9 @@ export default function StreamsDashboard() {
         nowSeconds,
       )
     : 0;
+
+  const protocolFee = stream ? computeProtocolFee(claimable, feeBps) : 0n;
+  const netClaimable = claimable - protocolFee;
 
   return (
     <div className="min-h-screen bg-[#06060c] text-slate-100 selection:bg-purple-500/30 selection:text-purple-200">
@@ -443,8 +461,12 @@ export default function StreamsDashboard() {
                       <dd className="mt-1 text-slate-300">{formatAmount(stream.withdrawn)}</dd>
                     </div>
                     <div>
-                      <dt className="text-[10px] text-slate-500 uppercase">Claimable</dt>
-                      <dd className="mt-1 font-bold text-cyan-300">{formatAmount(claimable)}</dd>
+                      <dt className="text-[10px] text-slate-500 uppercase">Claimable (net)</dt>
+                      <dd className="mt-1 font-bold text-cyan-300">{formatAmount(netClaimable)}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-[10px] text-slate-500 uppercase">Protocol fee</dt>
+                      <dd className="mt-1 text-slate-400">{formatAmount(protocolFee)}</dd>
                     </div>
                   </dl>
 
