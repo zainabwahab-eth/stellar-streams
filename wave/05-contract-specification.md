@@ -239,6 +239,19 @@ discriminant is renumbered.
   Transfers only that milestone to the payee and emits `MilestoneReleased`.
   Releasing the final milestone moves the escrow to `Released`.
 - `get_milestones(id)` / `is_milestone_released(id, index)` — read-only views.
+- `remaining_amount(id)` — read-only view (#307). The sum of the unreleased
+  milestones for a milestone escrow (`0` once every milestone is released), or
+  `Escrow.amount` for an escrow without a schedule. It reads the amount and the
+  flags only, not `Escrow.status`. Unknown id → `EscrowNotFound`; a schedule
+  whose released flags are missing → `MilestoneScheduleNotFound`.
+
+### Events
+
+- `MilestonesConfigured` (#308) — topics `("escrow", "milestones_configured", id)`,
+  payload `{ payer, amounts }`. Published by `set_milestones` after the schedule
+  and its released flags are written, so a rejected schedule emits nothing.
+- `MilestoneReleased` — topics `("escrow", "milestone_released", id)`, payload
+  `{ index, caller, payee, amount }`.
 
 `release_escrow` rejects milestone escrows (`InvalidStateTransition`) so a full
 release cannot bypass the schedule. `refund_escrow` and the deadline path of

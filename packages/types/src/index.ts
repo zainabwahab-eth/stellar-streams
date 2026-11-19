@@ -168,6 +168,35 @@ export function normalizeConfig(raw: unknown): StreamConfig {
 }
 
 /**
+ * The amount vested so far and the amount withdrawable now, read together
+ * from the stream contract's `vesting_summary` view. Both are in the token's
+ * smallest unit and kept as `bigint`, like the separate `vested` and
+ * `claimable` reads.
+ */
+export interface VestingSummary {
+  /** Total vested so far, including what has already been withdrawn. */
+  vested: bigint;
+  /** Vested but not yet withdrawn. */
+  claimable: bigint;
+}
+
+/** Raw values returned by the Soroban `vesting_summary` method. */
+export interface RawVestingSummary {
+  vested: bigint;
+  claimable: bigint;
+}
+
+/** Convert a raw `vesting_summary` response into its domain shape after validating it. */
+export function normalizeVestingSummary(raw: unknown): VestingSummary {
+  if (!isRecord(raw)) throw new ContractResponseError('stream', '<response>', 'an object');
+  if (typeof raw.vested !== 'bigint')
+    throw new ContractResponseError('stream', 'vested', 'a bigint');
+  if (typeof raw.claimable !== 'bigint')
+    throw new ContractResponseError('stream', 'claimable', 'a bigint');
+  return { vested: raw.vested, claimable: raw.claimable };
+}
+
+/**
  * Inputs for `create_stream`. `token` is any token contract id (C...), and
  * `amount` is in that token's smallest unit — scale it by the token's own
  * `decimals()`, which is 7 for XLM and SACs but not for every token.

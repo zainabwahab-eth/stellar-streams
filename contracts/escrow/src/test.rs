@@ -2,8 +2,9 @@
 #![allow(elided_lifetimes_in_paths, mismatched_lifetime_syntaxes)]
 use super::*;
 use soroban_sdk::{
+    map,
     testutils::{storage::Instance as _, Events as _, Ledger},
-    vec, Env, Event, IntoVal,
+    vec, Env, Event, IntoVal, Map, Symbol,
 };
 
 #[path = "../../test-support/test_support.rs"]
@@ -936,4 +937,154 @@ fn test_milestone_schedule_must_sum_to_escrow_amount() {
         Err(Ok(EscrowError::MilestoneScheduleInvalid))
     );
     assert_eq!(client.get_milestones(&1), None);
+}
+
+/// Escrow #1 for 1000 tokens with a deadline of 1000 and no milestone
+/// schedule. The payer holds 1000.
+fn milestone_ready_escrow(
+    env: &Env,
+) -> (TestToken<'_>, Address, Address, Address, EscrowContractClient<'_>) {
+    env.mock_all_auths();
+    let token = TestToken::deploy(env);
+    let payer = account(env);
+    let payee = account(env);
+    let arbiter = account(env);
+    token.mint(&payer, 1000);
+    let client = register(env);
+    client.create_escrow(&payer, &payee, &arbiter, &token.id, &1000, &1000);
+    (token, payer, payee, arbiter, client)
+}
+
+#[test]
+fn test_set_milestones_emits_milestones_configured() {
+    let env = Env::default();
+    let (_token, payer, _payee, _arbiter, client) = milestone_ready_escrow(&env);
+
+    let amounts = vec![&env, 250_i128, 350, 400];
+    client.set_milestones(&1, &payer, &amounts);
+
+    // Read the event before any other call: `env.events().all()` only holds
+    // the most recent invocation's events.
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        events,
+        [MilestonesConfigured { id: 1, payer: payer.clone(), amounts: amounts.clone() }
+            .to_xdr(&env, &client.address)],
+    );
+
+    // Pin the wire format independently of the struct, so renaming a topic or
+    // a payload field breaks this test instead of silently breaking indexers:
+    // topics are `("escrow", "milestones_configured", id)` and the payload is a
+    // map of the non-topic fields.
+    let topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (Symbol::new(&env, "escrow"), Symbol::new(&env, "milestones_configured"), 1_u64)
+            .into_val(&env);
+    let payload: Map<Symbol, soroban_sdk::Val> = map![
+        &env,
+        (Symbol::new(&env, "amounts"), amounts.into_val(&env)),
+        (Symbol::new(&env, "payer"), payer.into_val(&env)),
+    ];
+    assert_eq!(events, vec![&env, (client.address.clone(), topics, payload.into_val(&env))]);
+
+    // The schedule the event announces is the one that was persisted.
+    assert_eq!(client.get_milestones(&1), Some(amounts));
+}
+
+#[test]
+fn test_rejected_set_milestones_emits_no_event() {
+    let env = Env::default();
+    let (_token, payer, _payee, _arbiter, client) = milestone_ready_escrow(&env);
+
+    assert_eq!(
+        client.try_set_milestones(&1, &payer, &vec![&env, 400, 500]),
+        Err(Ok(EscrowError::MilestoneScheduleInvalid))
+    );
+    assert_eq!(env.events().all().filter_by_contract(&client.address), []);
+    assert_eq!(client.get_milestones(&1), None);
+}
+
+#[test]
+fn test_remaining_amount_without_schedule_is_full_amount() {
+    let env = Env::default();
+    let (_token, payer, _payee, _arbiter, client) = milestone_ready_escrow(&env);
+
+    assert_eq!(client.remaining_amount(&1), 1000);
+    client.fund_escrow(&1);
+    assert_eq!(client.remaining_amount(&1), 1000);
+
+    // The view reads the amount and milestone flags, not the status, so a
+    // single-release escrow reports its full amount even once finalized.
+    client.release_escrow(&1, &payer);
+    assert_eq!(client.get_escrow(&1).unwrap().status, EscrowStatus::Released);
+    assert_eq!(client.remaining_amount(&1), 1000);
+}
+
+#[test]
+fn test_remaining_amount_partially_released_schedule() {
+    let env = Env::default();
+    let (token, payer, payee, arbiter, client) = milestone_ready_escrow(&env);
+
+    client.set_milestones(&1, &payer, &vec![&env, 250, 350, 400]);
+    assert_eq!(client.remaining_amount(&1), 1000);
+    client.fund_escrow(&1);
+    assert_eq!(client.remaining_amount(&1), 1000);
+
+    // Release out of order: the view sums whichever milestones are unreleased.
+    client.release_milestone(&1, &1, &arbiter);
+    assert_eq!(client.remaining_amount(&1), 650);
+    client.release_milestone(&1, &0, &payer);
+    assert_eq!(client.remaining_amount(&1), 400);
+
+    // What the view reports is exactly what the contract still holds.
+    assert_eq!(token.balance(&client.address), 400);
+    assert_eq!(token.balance(&payee), 600);
+    assert_eq!(client.get_escrow(&1).unwrap().status, EscrowStatus::Funded);
+}
+
+#[test]
+fn test_remaining_amount_fully_released_escrow_is_zero() {
+    let env = Env::default();
+    let (token, payer, _payee, arbiter, client) = milestone_ready_escrow(&env);
+
+    client.set_milestones(&1, &payer, &vec![&env, 400, 600]);
+    client.fund_escrow(&1);
+    client.release_milestone(&1, &0, &arbiter);
+    client.release_milestone(&1, &1, &arbiter);
+
+    assert_eq!(client.get_escrow(&1).unwrap().status, EscrowStatus::Released);
+    assert_eq!(client.remaining_amount(&1), 0);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+#[test]
+fn test_remaining_amount_after_refund_matches_refunded_amount() {
+    let env = Env::default();
+    let (token, payer, _payee, arbiter, client) = milestone_ready_escrow(&env);
+
+    client.set_milestones(&1, &payer, &vec![&env, 400, 600]);
+    client.fund_escrow(&1);
+    client.release_milestone(&1, &0, &arbiter);
+    client.refund_escrow(&1, &arbiter);
+
+    // The unreleased milestone went back to the payer and the view still
+    // reports it, matching `refund_escrow`'s own accounting.
+    assert_eq!(token.balance(&payer), 600);
+    assert_eq!(client.remaining_amount(&1), 600);
+}
+
+#[test]
+fn test_remaining_amount_errors() {
+    let env = Env::default();
+    let (_token, payer, _payee, _arbiter, client) = milestone_ready_escrow(&env);
+
+    assert_eq!(client.try_remaining_amount(&2), Err(Ok(EscrowError::EscrowNotFound)));
+
+    // A schedule whose released flags are gone is the one case where the
+    // schedule is required and absent. Simulate it directly in storage, since
+    // no entry point can produce it.
+    client.set_milestones(&1, &payer, &vec![&env, 400, 600]);
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::MilestoneReleased(1));
+    });
+    assert_eq!(client.try_remaining_amount(&1), Err(Ok(EscrowError::MilestoneScheduleNotFound)));
 }

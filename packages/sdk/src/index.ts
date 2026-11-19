@@ -24,8 +24,14 @@ import type {
   Escrow,
   Stream,
   StreamConfig,
+  VestingSummary,
 } from '@stellar-starter-kit/types';
-import { normalizeConfig, normalizeEscrow, normalizeStream } from '@stellar-starter-kit/types';
+import {
+  normalizeConfig,
+  normalizeEscrow,
+  normalizeStream,
+  normalizeVestingSummary,
+} from '@stellar-starter-kit/types';
 
 /**
  * A memo attached to a write transaction. Text memos are for exchange-style
@@ -537,6 +543,8 @@ export type StreamErrorCode =
   | 'EMPTY_BATCH'
   | 'BATCH_TOO_LARGE'
   | 'BATCH_OVERFLOW'
+  | 'STREAM_PAUSED'
+  | 'NOT_PAUSED'
   | 'SAME_RECIPIENT';
 
 /**
@@ -585,6 +593,12 @@ const STREAM_ERROR_CODES: Record<number, StreamErrorCode> = {
   13: 'EMPTY_BATCH',
   14: 'BATCH_TOO_LARGE',
   15: 'BATCH_OVERFLOW',
+  // `StreamPaused`: returned by `withdraw` while the stream is paused.
+  16: 'STREAM_PAUSED',
+  // `NotPaused`: reserved by the contract for a strict `resume`; today
+  // `resume` on a running stream is a no-op, so it is named for forward
+  // compatibility rather than because any entry point returns it yet.
+  17: 'NOT_PAUSED',
   20: 'SAME_RECIPIENT',
 };
 
@@ -1344,6 +1358,33 @@ export class StreamsClient extends SorobanClient {
   }
 
   /**
+   * Vested and claimable amounts for a stream, read together from the
+   * contract's `vesting_summary` view. Costs one simulation and one storage
+   * read where calling {@link StreamsClient.vested} and
+   * {@link StreamsClient.claimable} separately costs two of each, so prefer it
+   * when polling both numbers.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @returns `{ vested, claimable }` in the token's smallest unit, both
+   *   `bigint`, with the same meaning as the two separate reads at the same
+   *   ledger.
+   * @throws StreamsError when the simulation fails with a contract error, e.g.
+   *   `STREAM_NOT_FOUND` (contract error `#4`) for an unknown id.
+   * @throws ContractResponseError when the contract returns a value that is
+   *   not a `VestingSummary`.
+   * @example
+   * ```typescript
+   * const { vested, claimable } = await client.getVestingSummary(stream.id);
+   * const progress = Number(vested) / Number(stream.totalAmount); // 0…1
+   * console.log(`${claimable} withdrawable now`);
+   * ```
+   */
+  async getVestingSummary(id: bigint | number | string): Promise<VestingSummary> {
+    const raw = await this.simulate('vesting_summary', nativeToScVal(BigInt(id), { type: 'u64' }));
+    return normalizeVestingSummary(raw);
+  }
+
+  /**
    * The id the next stream will receive.
    *
    * @returns The pending stream id, starting at `1n` on a fresh deployment.
@@ -1777,6 +1818,63 @@ export class StreamsClient extends SorobanClient {
     opts: O = {} as O,
   ): Promise<WriteResultFor<O>> {
     return this.invoke('cancel', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
+  }
+
+  /**
+   * Pause a stream so nothing more vests until it is resumed. Only the
+   * stream's sender can authorize it. Pausing a stream that is already paused
+   * succeeds without changing anything, and while it stays paused the
+   * recipient's `withdraw` fails with `STREAM_PAUSED`.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @param opts - per-call write options (`signal`, `fee`, `memo`,
+   *   `simulateOnly`); `opts.signal` aborts the prompt, submission and poll.
+   * @returns `{ hash }` of the confirmed transaction, or the simulation result
+   *   when `opts.simulateOnly` is set.
+   * @throws Error when no `publicKey` / `signTransaction` was configured.
+   * @throws StreamsError when the contract rejects the call — `STREAM_NOT_FOUND`
+   *   or `ALREADY_CANCELLED`.
+   * @example
+   * ```typescript
+   * await client.pause(stream.id);
+   * // later
+   * await client.resume(stream.id);
+   * ```
+   */
+  async pause<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    return this.invoke('pause', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
+  }
+
+  /**
+   * Resume a paused stream so it vests again. The paused interval is not
+   * made up: the stream keeps its `endTime`, so time spent paused never vests
+   * and the stream ends with less vested than its `totalAmount` (the
+   * remainder stays with the sender, e.g. as a refund on `cancel`). Only the
+   * stream's sender can authorize it, and resuming a stream that is not
+   * paused succeeds without changing anything.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @param opts - per-call write options (`signal`, `fee`, `memo`,
+   *   `simulateOnly`); `opts.signal` aborts the prompt, submission and poll.
+   * @returns `{ hash }` of the confirmed transaction, or the simulation result
+   *   when `opts.simulateOnly` is set.
+   * @throws Error when no `publicKey` / `signTransaction` was configured.
+   * @throws StreamsError when the contract rejects the call — `STREAM_NOT_FOUND`
+   *   or `ALREADY_CANCELLED` (and `NOT_PAUSED`, should the contract adopt its
+   *   reserved strict variant).
+   * @example
+   * ```typescript
+   * const { hash } = await client.resume(stream.id, { fee: '2000000' });
+   * ```
+   */
+  async resume<O extends WriteOptions = WriteOptions>(
+    id: bigint | number | string,
+    opts: O = {} as O,
+  ): Promise<WriteResultFor<O>> {
+    return this.invoke('resume', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
   }
 
   /**

@@ -79,6 +79,30 @@ if (claimableAmount > 0n) {
 }
 ```
 
+### Vested and Claimable in One Read
+
+`getVestingSummary` returns both numbers from the contract's `vesting_summary`
+view: one simulation instead of two, so prefer it when polling.
+
+```typescript
+const { vested, claimable } = await client.getVestingSummary(streamId); // both bigint
+```
+
+An unknown id rejects with a `StreamsError` whose `code` is `STREAM_NOT_FOUND`.
+
+### Pause and Resume
+
+The stream's sender can pause accrual and resume it later. The stream keeps its
+end time, so time spent paused never vests: a stream paused for part of its
+schedule ends with less than `totalAmount` vested. Both calls are idempotent
+and accept the usual write options (`signal`, `fee`, `memo`, `simulateOnly`).
+
+```typescript
+await client.pause(streamId);
+// While paused, the recipient's withdraw fails with StreamsError code 'STREAM_PAUSED'.
+await client.resume(streamId, { memo: { type: 'text', value: 'resumed' } });
+```
+
 ### Working with Classic Assets
 
 To stream classic Stellar assets (such as issued USDC or native XLM), derive the Stellar Asset Contract (SAC) id using `assetContractId`:

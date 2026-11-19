@@ -13,6 +13,7 @@ import {
   normalizeEscrowSchedule,
   normalizeSplit,
   normalizeStream,
+  normalizeVestingSummary,
   type Stream,
 } from './index';
 
@@ -299,5 +300,23 @@ describe('contract response guards', () => {
   it('rejects milestone arrays whose lengths differ', () => {
     expect(isEscrowSchedule([400n, 600n], [true])).toBe(false);
     expect(() => normalizeEscrowSchedule([400n, 600n], [true])).toThrow(ContractResponseError);
+  });
+});
+
+describe('normalizeVestingSummary', () => {
+  it('keeps both amounts as bigint without precision loss', () => {
+    expect(
+      normalizeVestingSummary({ vested: 9_007_199_254_740_993n, claimable: 1_250_000_000n }),
+    ).toEqual({ vested: 9_007_199_254_740_993n, claimable: 1_250_000_000n });
+  });
+
+  it.each([
+    ['a non-object', null, '<response>', 'an object'],
+    ['a string vested', { vested: '1', claimable: 0n }, 'vested', 'a bigint'],
+    ['a missing claimable', { vested: 1n }, 'claimable', 'a bigint'],
+  ])('rejects %s naming the invalid field', (_case, raw, field, expected) => {
+    expect(() => normalizeVestingSummary(raw)).toThrow(
+      new ContractResponseError('stream', field, expected),
+    );
   });
 });

@@ -1,15 +1,27 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { Keypair, nativeToScVal, xdr } from '@stellar/stellar-sdk';
+import { Keypair, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+import { ContractResponseError } from '@stellar-starter-kit/types';
+import { StreamsError } from './index';
 import {
   CONTRACT_ID,
   PUBLIC_KEY,
   fakeTransport,
+  invokedArgs,
   invokedCall,
   makeClient,
   simulateByMethod,
+  simulationError,
   simulationSuccess,
   streamScVal,
 } from './test-helpers';
+
+/** A `VestingSummary` struct as the contract returns it. */
+function vestingSummaryScVal(vested: bigint, claimable: bigint): xdr.ScVal {
+  return nativeToScVal(
+    { vested, claimable },
+    { type: { vested: ['symbol', 'i128'], claimable: ['symbol', 'i128'] } },
+  );
+}
 
 const TREASURY = Keypair.random().publicKey();
 
@@ -42,6 +54,7 @@ describe('read call decoding', () => {
         claimable: nativeToScVal(1_250_000_000n, { type: 'i128' }),
         vested: nativeToScVal(2_500_000_000n, { type: 'i128' }),
         next_stream_id: nativeToScVal(9_007_199_254_740_993n, { type: 'u64' }),
+        vesting_summary: vestingSummaryScVal(2_500_000_000n, 1_250_000_000n),
       }),
     );
   });
@@ -108,5 +121,77 @@ describe('read call decoding', () => {
       { contractId: CONTRACT_ID, method: 'get_stream' },
       { contractId: CONTRACT_ID, method: 'next_stream_id' },
     ]);
+  });
+});
+
+describe('getVestingSummary', () => {
+  let rpc: ReturnType<typeof fakeTransport>;
+
+  beforeEach(() => {
+    rpc = fakeTransport();
+  });
+
+  it('reads vested and claimable in one vesting_summary simulation as bigints', async () => {
+    rpc.simulateTransaction.mockResolvedValue(
+      simulationSuccess(vestingSummaryScVal(2_500_000_000n, 1_250_000_000n)),
+    );
+
+    const summary = await makeClient({ transport: rpc }).getVestingSummary(7);
+
+    expect(summary).toEqual({ vested: 2_500_000_000n, claimable: 1_250_000_000n });
+    expect(typeof summary.vested).toBe('bigint');
+    expect(typeof summary.claimable).toBe('bigint');
+    expect(rpc.simulateTransaction).toHaveBeenCalledTimes(1);
+    const [tx] = rpc.simulateTransaction.mock.calls[0]!;
+    expect(invokedCall(tx)).toEqual({ contractId: CONTRACT_ID, method: 'vesting_summary' });
+    const [arg] = invokedArgs(tx);
+    expect(arg!.switch()).toBe(xdr.ScValType.scvU64());
+    expect(scValToNative(arg!)).toBe(7n);
+  });
+
+  it('keeps i128 amounts above 2^53 exact, matching vested and claimable', async () => {
+    // 2^53 + 1 is the first integer a JavaScript number cannot represent.
+    const big = 9_007_199_254_740_993n;
+    rpc.simulateTransaction.mockImplementation(
+      simulateByMethod({
+        vesting_summary: vestingSummaryScVal(big, big - 1n),
+        vested: nativeToScVal(big, { type: 'i128' }),
+        claimable: nativeToScVal(big - 1n, { type: 'i128' }),
+      }),
+    );
+    const client = makeClient({ transport: rpc });
+
+    const summary = await client.getVestingSummary('1');
+
+    expect(summary).toEqual({
+      vested: await client.vested(1),
+      claimable: await client.claimable(1),
+    });
+    expect(summary.vested).toBe(big);
+  });
+
+  it('surfaces a missing stream as STREAM_NOT_FOUND', async () => {
+    rpc.simulateTransaction.mockResolvedValue(
+      simulationError('HostError: Error(Contract, #4) stream not found'),
+    );
+
+    const error = (await makeClient({ transport: rpc })
+      .getVestingSummary(99)
+      .catch((e: unknown) => e)) as StreamsError;
+
+    expect(error).toBeInstanceOf(StreamsError);
+    expect(error.code).toBe('STREAM_NOT_FOUND');
+    expect(error.contractCode).toBe(4);
+    expect(error.message).toContain('Simulation of vesting_summary failed');
+  });
+
+  it('rejects a response that is not a VestingSummary', async () => {
+    rpc.simulateTransaction.mockResolvedValue(
+      simulationSuccess(nativeToScVal(1n, { type: 'i128' })),
+    );
+
+    await expect(makeClient({ transport: rpc }).getVestingSummary(1)).rejects.toThrow(
+      new ContractResponseError('stream', '<response>', 'an object'),
+    );
   });
 });
